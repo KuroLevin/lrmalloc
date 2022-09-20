@@ -32,12 +32,15 @@ void HeapPushPartial(Descriptor* desc);
 Descriptor* HeapPopPartial(ProcHeap* heap);
 void MallocFromPartial(size_t scIdx, TCacheBin* cache, size_t& blockNum);
 void MallocFromNewSB(size_t scIdx, TCacheBin* cache, size_t& blockNum);
-Descriptor* DescAlloc();
-void DescRetire(Descriptor* desc);
+Descriptor* DescAllocEmpty();
+Descriptor* DescAllocFull();
+void DescRetireEmpty(Descriptor* desc);
+void DescRetireFull(Descriptor* desc);
 
 // global variables
 // descriptor recycle list
-std::atomic<DescriptorNode> sAvailDesc({ nullptr });
+std::atomic<DescriptorNode> sAvailDescEmpty({ nullptr });
+std::atomic<DescriptorNode> sAvailDescFull({ nullptr });
 // malloc init state
 bool sMallocInit = false;
 // heaps, one heap per size class
@@ -206,7 +209,11 @@ void MallocFromPartial(size_t scIdx, TCacheBin* cache, size_t& blockNum)
     // due to free()
     do {
         if (oldAnchor.state == SB_EMPTY) {
-            DescRetire(desc);
+            if(oldAnchor.persistent){
+                DescRetireFull(desc);
+            } else {
+                DescRetireEmpty(desc);
+            }
             // retry
             return MallocFromPartial(scIdx, cache, blockNum);
         }
@@ -249,7 +256,14 @@ void MallocFromNewSB(size_t scIdx, TCacheBin* cache, size_t& blockNum)
     ProcHeap* heap = &sHeaps[scIdx];
     SizeClassData* sc = &SizeClasses[scIdx];
 
-    Descriptor* desc = DescAlloc();
+    bool persistent = false;
+    Descriptor* desc = DescAllocFull();
+    if(desc) {
+        persistent = true;
+        ASSERT(desc->anchor.load().persistent);
+    } else {
+        desc = DescAllocEmpty();
+    }
     ASSERT(desc);
 
     uint32_t const blockSize = sc->blockSize;
@@ -258,7 +272,9 @@ void MallocFromNewSB(size_t scIdx, TCacheBin* cache, size_t& blockNum)
     desc->heap = heap;
     desc->blockSize = blockSize;
     desc->maxcount = maxcount;
-    desc->superblock = sMapCache.Alloc();
+    if(!persistent) {
+        desc->superblock = sMapCache.Alloc();
+    }
 
     cache->PushList(desc->superblock, maxcount);
 
@@ -266,7 +282,7 @@ void MallocFromNewSB(size_t scIdx, TCacheBin* cache, size_t& blockNum)
     anchor.avail = maxcount;
     anchor.count = 0;
     anchor.state = SB_FULL;
-    anchor.persistent = false;
+    anchor.persistent = persistent;
 
     desc->anchor.store(anchor);
 
@@ -284,15 +300,34 @@ void MallocFromNewSB(size_t scIdx, TCacheBin* cache, size_t& blockNum)
     blockNum += maxcount;
 }
 
-Descriptor* DescAlloc()
+Descriptor* DescAllocFull()
 {
-    DescriptorNode oldHead = sAvailDesc.load();
+    DescriptorNode oldHead = sAvailDescFull.load();
     while (true) {
         Descriptor* desc = oldHead.GetDesc();
         if (desc) {
             DescriptorNode newHead = desc->nextFree.load();
             newHead.Set(newHead.GetDesc(), oldHead.GetCounter());
-            if (sAvailDesc.compare_exchange_weak(oldHead, newHead)) {
+            if (sAvailDescFull.compare_exchange_weak(oldHead, newHead)) {
+                ASSERT(desc->blockSize == 0);
+                return desc;
+            }
+        } else {
+            return nullptr;
+        }
+    }
+}
+
+
+Descriptor* DescAllocEmpty()
+{
+    DescriptorNode oldHead = sAvailDescEmpty.load();
+    while (true) {
+        Descriptor* desc = oldHead.GetDesc();
+        if (desc) {
+            DescriptorNode newHead = desc->nextFree.load();
+            newHead.Set(newHead.GetDesc(), oldHead.GetCounter());
+            if (sAvailDescEmpty.compare_exchange_weak(oldHead, newHead)) {
                 ASSERT(desc->blockSize == 0);
                 return desc;
             }
@@ -324,12 +359,12 @@ Descriptor* DescAlloc()
                 prev->nextFree.store({ nullptr });
 
                 // add list to available descriptors
-                DescriptorNode oldHead = sAvailDesc.load();
+                DescriptorNode oldHead = sAvailDescEmpty.load();
                 DescriptorNode newHead;
                 do {
                     prev->nextFree.store(oldHead);
                     newHead.Set(first, oldHead.GetCounter() + 1);
-                } while (!sAvailDesc.compare_exchange_weak(oldHead, newHead));
+                } while (!sAvailDescEmpty.compare_exchange_weak(oldHead, newHead));
             }
 
             return ret;
@@ -337,16 +372,28 @@ Descriptor* DescAlloc()
     }
 }
 
-void DescRetire(Descriptor* desc)
+void DescRetireEmpty(Descriptor* desc)
 {
     desc->blockSize = 0;
-    DescriptorNode oldHead = sAvailDesc.load();
+    DescriptorNode oldHead = sAvailDescEmpty.load();
     DescriptorNode newHead;
     do {
         desc->nextFree.store(oldHead);
 
         newHead.Set(desc, oldHead.GetCounter() + 1);
-    } while (!sAvailDesc.compare_exchange_weak(oldHead, newHead));
+    } while (!sAvailDescEmpty.compare_exchange_weak(oldHead, newHead));
+}
+
+void DescRetireFull(Descriptor* desc)
+{
+    desc->blockSize = 0;
+    DescriptorNode oldHead = sAvailDescFull.load();
+    DescriptorNode newHead;
+    do {
+        desc->nextFree.store(oldHead);
+
+        newHead.Set(desc, oldHead.GetCounter() + 1);
+    } while (!sAvailDescFull.compare_exchange_weak(oldHead, newHead));
 }
 
 void FillCache(size_t scIdx, TCacheBin* cache)
@@ -424,7 +471,7 @@ void FlushCache(size_t scIdx, TCacheBin* cache)
             }
 
             ASSERT(oldAnchor.count < desc->maxcount);
-            if (oldAnchor.count + blockCount == desc->maxcount and !oldAnchor.persistent) {
+            if (oldAnchor.count + blockCount == desc->maxcount) {
                 newAnchor.count = desc->maxcount - 1;
                 newAnchor.state = SB_EMPTY; // can free superblock
             } else {
@@ -443,8 +490,13 @@ void FlushCache(size_t scIdx, TCacheBin* cache)
             // unregister descriptor
             UnregisterDesc(heap, superblock);
 
-            // free superblock
-            sMapCache.Free(superblock);
+            if(newAnchor.persistent) {
+                // free physical memory while keeping virtual mapping
+                PageFreePersistent(superblock, SB_SIZE);
+            } else {
+                // free superblock
+                sMapCache.Free(superblock);
+            }
         } else if (oldAnchor.state == SB_FULL) {
             HeapPushPartial(desc);
         }
@@ -483,7 +535,7 @@ void* do_malloc(size_t size)
     // large block allocation
     if (UNLIKELY(size > MAX_SZ)) {
         size_t pages = PAGE_CEILING(size);
-        Descriptor* desc = DescAlloc();
+        Descriptor* desc = DescAllocEmpty();
         ASSERT(desc);
 
         desc->heap = nullptr;
@@ -564,7 +616,7 @@ void* do_aligned_alloc(size_t alignment, size_t size)
         }
 
         size_t pages = PAGE_CEILING(size);
-        Descriptor* desc = DescAlloc();
+        Descriptor* desc = DescAllocEmpty();
         ASSERT(desc);
 
         char* ptr = (char*)PageAlloc(pages);
@@ -642,7 +694,7 @@ void do_free(void* ptr)
 
         // desc cannot be in any partial list, so it can be
         //  immediately reused
-        DescRetire(desc);
+        DescRetireEmpty(desc);
         return;
     }
 

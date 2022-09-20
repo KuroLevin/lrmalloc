@@ -46,3 +46,12 @@ void PageFree(void* ptr, size_t size)
     (void)ret; // suppress warning
     ASSERT(ret == 0);
 }
+
+void PageFreePersistent(void* ptr, size_t size)
+{
+    ASSERT((size & PAGE_MASK) == 0);
+
+    int ret = madvise(ptr, size, MADV_DONTNEED);
+    (void)ret; // suppress warning
+    ASSERT(ret == 0);
+}

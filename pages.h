@@ -22,5 +22,7 @@ void* PageAlloc(size_t size);
 void* PageAllocOvercommit(size_t size);
 // free a set of continous pages, totaling to size bytes
 void PageFree(void* ptr, size_t size);
+// same as PageFree but keep the virtual adresses valid for read
+void PageFreePersistent(void* ptr, size_t size);
 
 #endif // __PAGES_H
