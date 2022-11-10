@@ -6,9 +6,25 @@
 
 #include "pages.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "log.h"
+
+// file descriptor for memory remappings
+int shmFd;
+
+void InitShmFd(void)
+{
+    //TODO: ensure name is unique even if init is beind done concurrenctly by diferent processes
+    //(maybe rely on PID) and take into consideration a process might not have cleaned up
+    shmFd = shm_open("/ThisShouldBeUnique", O_RDWR | O_CREAT | O_EXCL, 0600);
+    ASSERT(fd >= 0);
+    shm_unlink("/ThisShouldBeUnique");
+    if(ftruncate(shmFd, PAGE * PAGE))
+        abort();
+}
 
 void* PageAlloc(size_t size)
 {
@@ -47,11 +63,20 @@ void PageFree(void* ptr, size_t size)
     ASSERT(ret == 0);
 }
 
+void PageAllocPersistent(void* ptr, size_t size)
+{
+    ASSERT((size & PAGE_MASK) == 0);
+
+    void *ret = mmap(ptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+    (void)ret; // suppress warning
+    ASSERT(ret == ptr);
+}
+
 void PageFreePersistent(void* ptr, size_t size)
 {
     ASSERT((size & PAGE_MASK) == 0);
 
-    int ret = madvise(ptr, size, MADV_DONTNEED);
+    void *ret = mmap(ptr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, shmFd, 0);
     (void)ret; // suppress warning
-    ASSERT(ret == 0);
+    ASSERT(ret == ptr);
 }

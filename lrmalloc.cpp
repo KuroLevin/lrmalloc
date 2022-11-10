@@ -272,7 +272,9 @@ void MallocFromNewSB(size_t scIdx, TCacheBin* cache, size_t& blockNum)
     desc->heap = heap;
     desc->blockSize = blockSize;
     desc->maxcount = maxcount;
-    if(!persistent) {
+    if(persistent) {
+        PageAllocPersistent(desc->superblock, SB_SIZE);
+    } else {
         desc->superblock = sMapCache.Alloc();
     }
 
@@ -515,6 +517,9 @@ void InitMalloc()
 
     // init page map
     sPageMap.Init();
+
+    // init shm fd
+    InitShmFd();
 
     // init heaps
     for (size_t idx = 0; idx < MAX_SZ_IDX; ++idx) {
