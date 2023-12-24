@@ -12,6 +12,7 @@
 
 // for ENOMEM
 #include <errno.h>
+#include <stdatomic.h>
 
 #include "log.h"
 #include "lrmalloc.h"
@@ -756,11 +757,12 @@ extern "C" void* lf_palloc(size_t size) noexcept
     Descriptor* desc = info.GetDesc();
 
     Anchor newAnchor;
-    Anchor oldAnchor = desc->anchor.load();
-    do {
+    Anchor oldAnchor = desc->anchor.load(std::memory_order_relaxed);
+    while (!oldAnchor.persistent) {
         newAnchor = oldAnchor;
         newAnchor.persistent = true;
-    } while (!desc->anchor.compare_exchange_weak(oldAnchor, newAnchor));
+        desc->anchor.compare_exchange_weak(oldAnchor, newAnchor);
+    }
 
     return ptr;
 }
